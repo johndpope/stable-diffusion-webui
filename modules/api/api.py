@@ -1,8 +1,10 @@
 import base64
 import io
+import json
 import os
 import time
 import datetime
+import uuid
 import uvicorn
 import ipaddress
 import requests
@@ -15,7 +17,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
-
+from fastapi.staticfiles import StaticFiles
 import modules.shared as shared
 from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items
 from modules.api import models
@@ -209,7 +211,12 @@ class Api:
         self.app = app
         self.queue_lock = queue_lock
         api_middleware(self.app)
+
+                # Mount a static files route
+        app.mount("/images", StaticFiles(directory="/media/2TB/stable-diffusion-webui/api-images"), name="images")
+
         self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
+        self.add_api_route("/sdapi/v1/txt2oneimg", self.text2oneimgapi, methods=["POST"], response_model=models.ImageResponse)
         self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
         self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=models.ExtrasSingleImageResponse)
         self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=models.ExtrasBatchImagesResponse)
@@ -382,9 +389,92 @@ class Api:
                     shared.state.end()
                     shared.total_tqdm.clear()
 
+
         b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
 
         return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+
+    def text2oneimgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
+            script_runner = scripts.scripts_txt2img
+
+            txt2imgreq.prompt += "<lora:pixel_art:5> pixel art"
+            if not script_runner.scripts:
+                script_runner.initialize_scripts(False)
+                ui.create_ui()
+            if not self.default_script_arg_txt2img:
+                self.default_script_arg_txt2img = self.init_default_script_args(script_runner)
+            selectable_scripts, selectable_script_idx = self.get_selectable_script(txt2imgreq.script_name, script_runner)
+
+            populate = txt2imgreq.copy(update={  # Override __init__ params
+                "sampler_name": validate_sampler_name(txt2imgreq.sampler_name or txt2imgreq.sampler_index),
+                "do_not_save_samples": not txt2imgreq.save_images,
+                "do_not_save_grid": not txt2imgreq.save_images,
+            })
+            if populate.sampler_name:
+                populate.sampler_index = None  # prevent a warning later on
+
+            args = vars(populate)
+            args.pop('script_name', None)
+            args.pop('script_args', None) # will refeed them to the pipeline directly after initializing them
+            args.pop('alwayson_scripts', None)
+            args.pop('send_images', True)
+            args.pop('save_images', None)
+
+            script_args = self.init_script_args(txt2imgreq, self.default_script_arg_txt2img, selectable_scripts, selectable_script_idx, script_runner)
+
+            with self.queue_lock:
+                with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
+                    p.is_api = True
+                    p.scripts = script_runner
+                    p.outpath_grids = opts.outdir_txt2img_grids
+                    p.outpath_samples = opts.outdir_txt2img_samples
+
+                    try:
+                        shared.state.begin(job="scripts_txt2img")
+                        if selectable_scripts is not None:
+                            p.script_args = script_args
+                            processed = scripts.scripts_txt2img.run(p, *p.script_args) # Need to pass args as list here
+                        else:
+                            p.script_args = tuple(script_args) # Need to pass args as tuple here
+                            processed = process_images(p)
+                    finally:
+                        shared.state.end()
+                        shared.total_tqdm.clear()
+
+            # Instead of handling a list of images, focus on the first one.
+            processed_image = processed.images[0] if processed.images else None
+
+            # Prepare your response object
+            response = models.ImageResponse()
+            # If an image is processed, encode it to Base64 and format as a data URL.
+            if processed_image:
+
+                file_name = f"{uuid.uuid4()}.png"  # Ensure a unique file name
+                file_path = f"api-images/{file_name}"
+                processed_image.save(file_path)
+
+                # Host the image (This part is highly dependent on your setup)
+                # For example, if you're using a service like AWS S3, you would upload the file there
+                # and get a URL back. For this example, let's assume the file is accessible
+                # directly via a static file server you've set up.
+                response.url = f"https://covershot.ngrok.app/images/{file_name}"
+
+                img_byte_arr = BytesIO()
+                processed_image.save(img_byte_arr, format='PNG')  # Save image to the bytes buffer as PNG
+                img_byte_arr = img_byte_arr.getvalue()  # Get the byte value of the image
+
+                # Encode the image bytes in base64
+                b64_image = base64.b64encode(img_byte_arr).decode('utf-8')
+
+                # If you're sending the image as base64 JSON
+                # b64_image = base64.b64encode(processed_image).decode('utf-8')
+                response.b64_json = json.dumps({"image": b64_image})
+
+                # If there's a revised prompt, you would set it here
+                response.revised_prompt =  txt2imgreq.prompt
+
+            # Return the formatted response.
+            return response
 
     def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
         init_images = img2imgreq.init_images

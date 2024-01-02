@@ -129,6 +129,19 @@ StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
     ]
 ).generate_model()
 
+
+class ImageResponse(BaseModel):
+    b64_json: Optional[str]
+    url: Optional[str]
+    revised_prompt: Optional[str]
+
+
+
+class TextToOneImageResponse(BaseModel):
+    image: Optional[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
+    parameters: dict
+    info: str
+
 class TextToImageResponse(BaseModel):
     images: List[str] = Field(default=None, title="Image", description="The generated image in base64 format.")
     parameters: dict
